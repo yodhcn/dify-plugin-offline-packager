@@ -33,7 +33,7 @@ GITHUB_API_URL = os.environ.get("GITHUB_API_URL", "https://github.com")
 PIP_INDEX_URL = os.environ.get(
     "PIP_INDEX_URL", "https://pypi.org/simple"
 )
-DIFY_PLUGIN_VERSION = os.environ.get("DIFY_PLUGIN_VERSION", "0.5.3")
+DIFY_PLUGIN_DAEMON_VERSION = os.environ.get("DIFY_PLUGIN_DAEMON_VERSION", "0.5.3")
 
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "/difypkg"))
 WORK_DIR = Path(os.environ.get("WORK_DIR", "/tmp/packager-work"))
@@ -55,7 +55,13 @@ def download_file(url: str, dest: str) -> None:
 def run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
     """Run a subprocess, printing the command and raising on failure."""
     print(f"  ▸ {' '.join(cmd)}", flush=True)
-    return subprocess.run(cmd, check=True, **kwargs)
+    try:
+        return subprocess.run(cmd, check=True, **kwargs)
+    except subprocess.CalledProcessError as e:
+        if e.stderr:
+            print(e.stderr if isinstance(e.stderr, str) else e.stderr.decode(errors="replace"),
+                  file=sys.stderr, flush=True)
+        sys.exit(f"\n❌ Command failed (exit {e.returncode}): {' '.join(e.cmd)}")
 
 
 def ensure_dify_plugin_cli(work: Path) -> Path:
@@ -73,16 +79,16 @@ def ensure_dify_plugin_cli(work: Path) -> Path:
         sys.exit(f"Unsupported architecture: {machine}")
 
     binary_name = f"dify-plugin-linux-{arch}"
-    cached = Path("/tmp") / f"dify-plugin-cli-{DIFY_PLUGIN_VERSION}-{arch}"
+    cached = Path("/tmp") / f"dify-plugin-cli-{DIFY_PLUGIN_DAEMON_VERSION}-{arch}"
 
     if cached.exists():
         return cached
 
     url = (
         f"https://github.com/langgenius/dify-plugin-daemon"
-        f"/releases/download/{DIFY_PLUGIN_VERSION}/{binary_name}"
+        f"/releases/download/{DIFY_PLUGIN_DAEMON_VERSION}/{binary_name}"
     )
-    print(f"⬇  Downloading dify-plugin CLI ({DIFY_PLUGIN_VERSION}) …")
+    print(f"⬇  Downloading dify-plugin CLI ({DIFY_PLUGIN_DAEMON_VERSION}) …")
     print(f"   {url}")
     download_file(url, str(cached))
     cached.chmod(cached.stat().st_mode | stat.S_IEXEC)
@@ -136,7 +142,7 @@ def resolve_local(path_str: str) -> Path:
 
 
 def _download_wheels_pip(req_file: Path, wheels_dir: Path) -> None:
-    """Download wheels using uv based on requirements.txt."""
+    """Download wheels using pip based on requirements.txt."""
     cmd = [
         "uv", "run", "pip", "download",
         "-r", str(req_file),
@@ -150,43 +156,170 @@ def _download_wheels_pip(req_file: Path, wheels_dir: Path) -> None:
 
 
 def _download_wheels_uv(extract_dir: Path, wheels_dir: Path) -> None:
-    """Download wheels using uv based on pyproject.toml."""
-    # Export pinned dependencies from pyproject.toml
-    print("⬇  Exporting dependencies from pyproject.toml …")
+    """
+    Lock and download wheels using uv based on pyproject.toml.
+
+    Steps:
+      1. Inject ``environments`` and strip ``[dependency-groups]`` so that
+         ``uv lock`` only resolves production deps for Linux + current Python.
+      2. ``uv lock`` to generate / refresh uv.lock (pins exact versions).
+      3. ``uv export --frozen --no-hashes --no-dev`` to get the pinned list.
+      4. ``uv run pip download`` to fetch all wheels into ``wheels_dir``.
+      5. Delete uv.lock so the target machine re-resolves from wheels/ only
+         (``--no-index`` + ``--frozen`` is a conflicting combination in uv).
+    """
+    pyproject_file = extract_dir / "pyproject.toml"
+
+    # ------------------------------------------------------------------
+    # 1. Inject environments and strip dev groups before locking.
+    # ------------------------------------------------------------------
+    _inject_environments(pyproject_file)
+    _strip_dependency_groups(pyproject_file)
+
+    # ------------------------------------------------------------------
+    # 2. (Re-)generate uv.lock scoped to the target environment.
+    # ------------------------------------------------------------------
+    print("🔐 Locking dependencies …")
+    run(["uv", "lock", "--directory", str(extract_dir)])
+
+    # ------------------------------------------------------------------
+    # 3. Export the frozen dependency list (no hashes, no dev).
+    # ------------------------------------------------------------------
+    print("⬇  Exporting pinned dependencies …")
     export_result = subprocess.run(
-        ["uv", "export", "--frozen", "--no-hashes", "--directory", str(extract_dir)],
+        [
+            "uv", "export",
+            "--frozen", "--no-hashes", "--no-dev",
+            "--directory", str(extract_dir),
+        ],
         capture_output=True, text=True,
     )
     if export_result.returncode != 0:
-        # Fallback: try uv export without --frozen
-        export_result = subprocess.run(
-            ["uv", "export", "--no-hashes", "--directory", str(extract_dir)],
-            capture_output=True, text=True,
-        )
-    if export_result.returncode != 0:
-        print("   ⚠  uv export failed, falling back to requirements.txt")
+        print("   ⚠  uv export failed:")
+        print(export_result.stderr, file=sys.stderr)
+        # Fallback to requirements.txt if present
         req_file = extract_dir / "requirements.txt"
         if req_file.exists():
+            print("   ↪  Falling back to requirements.txt")
             _download_wheels_pip(req_file, wheels_dir)
         return
 
-    # Write exported requirements to a temp file and download via uv
+    # Write the exported list to a temp file and download
     exported_req = extract_dir / "_exported_requirements.txt"
     exported_req.write_text(export_result.stdout)
+    try:
+        cmd = [
+            "uv", "run", "pip", "download",
+            "-r", str(exported_req),
+            "-d", str(wheels_dir),
+        ]
+        if PIP_INDEX_URL:
+            cmd += ["--index-url", PIP_INDEX_URL]
+        print("⬇  Downloading Python dependencies …")  # step 4
+        run(cmd)
+    finally:
+        exported_req.unlink(missing_ok=True)
 
-    cmd = [
-        "uv", "run", "pip", "download",
-        "-r", str(exported_req),
-        "-d", str(wheels_dir),
-    ]
-    if PIP_INDEX_URL:
-        cmd += ["--index-url", PIP_INDEX_URL]
+    # ------------------------------------------------------------------
+    # 5. Delete uv.lock so the target machine re-resolves from wheels/.
+    #    uv --no-index + --frozen is a conflicting combination (uv#15519).
+    # ------------------------------------------------------------------
+    uv_lock = extract_dir / "uv.lock"
+    if uv_lock.exists():
+        uv_lock.unlink()
+        print("   Ὕ1  Deleted uv.lock (target will re-resolve from wheels/).")
 
-    print("⬇  Downloading Python dependencies (from pyproject.toml) …")
-    run(cmd)
 
-    # Clean up temp file
-    exported_req.unlink(missing_ok=True)
+def _inject_environments(pyproject_file: Path) -> None:
+    """
+    Inject only the ``environments`` key into the ``[tool.uv]`` section of
+    pyproject.toml.
+
+    This is called **before** ``uv lock`` so that the lock file is scoped
+    to Linux + the current Python version only, avoiding unnecessary wheels
+    for other platforms or future Python versions.
+    """
+    py_ver = f"{sys.version_info.major}.{sys.version_info.minor}"  # e.g. "3.12"
+    content = pyproject_file.read_text()
+    env_line = f'environments = ["sys_platform == \'linux\' and python_version == \'{py_ver}\'"]'
+    uv_block = f'\n[tool.uv]\n{env_line}\n'
+
+    if re.search(r'^\[tool\.uv\]', content, re.MULTILINE):
+        def _inject(m: re.Match) -> str:
+            return m.group(0) + '\n' + env_line
+        content = re.sub(
+            r'^\[tool\.uv\]',
+            _inject,
+            content,
+            count=1,
+            flags=re.MULTILINE,
+        )
+    else:
+        content = content.rstrip() + "\n" + uv_block
+
+    pyproject_file.write_text(content)
+    print(f'   ✏  Injected environments = [linux + python {py_ver}] into pyproject.toml.')
+
+
+def _strip_dependency_groups(pyproject_file: Path) -> None:
+    """
+    Remove the ``[dependency-groups]`` section from pyproject.toml.
+
+    This is called **before** ``uv lock`` so that dev/test packages are never
+    included in the lockfile.  Even with ``uv sync --no-dev``, uv still
+    *resolves* dev-group packages when ``no-index = true``, causing
+    "not found in provided package locations" errors for packages that are
+    intentionally absent from wheels/ (see uv#15519).
+    """
+    content = pyproject_file.read_text()
+    new_content = re.sub(
+        r'^\[dependency-groups\].*?(?=^\[|\Z)',
+        '',
+        content,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    if new_content != content:
+        pyproject_file.write_text(new_content)
+        print("   ✏  Removed [dependency-groups] from pyproject.toml.")
+
+
+def _patch_pyproject_toml_offline(pyproject_file: Path) -> None:
+    """
+    Add offline settings to the ``[tool.uv]`` section of pyproject.toml.
+
+    Merges into the existing ``[tool.uv]`` section (which already has
+    ``environments`` from ``_inject_environments``)::
+
+        no-index = true
+        find-links = ["./wheels/"]
+
+    uv.lock is deleted before packaging so that the target machine
+    re-resolves dependencies from wheels/ only (uv#15519: --no-index +
+    --frozen is a conflicting combination).
+    """
+    content = pyproject_file.read_text()
+
+    offline_settings = (
+        'no-index = true\n'
+        'find-links = ["./wheels/"]'
+    )
+    uv_block = f'\n[tool.uv]\n{offline_settings}\n'
+
+    if re.search(r'^\[tool\.uv\]', content, re.MULTILINE):
+        def _inject(m: re.Match) -> str:
+            return m.group(0) + '\n' + offline_settings
+        content = re.sub(
+            r'^\[tool\.uv\]',
+            _inject,
+            content,
+            count=1,
+            flags=re.MULTILINE,
+        )
+    else:
+        content = content.rstrip() + "\n" + uv_block
+
+    pyproject_file.write_text(content)
+    print("   ✏  Patched pyproject.toml with [tool.uv] offline settings (no-index, find-links).")
 
 
 def _patch_requirements_txt_offline(req_file: Path) -> None:
@@ -194,99 +327,21 @@ def _patch_requirements_txt_offline(req_file: Path) -> None:
     original = req_file.read_text()
     patched = f"--no-index --find-links=./wheels/\n{original}"
     req_file.write_text(patched)
+    print("   ✏  Patched requirements.txt for offline use.")
 
 
-def _detect_python_version() -> str:
-    """Return the running Python version as 'MAJOR.MINOR' (e.g. '3.12')."""
-    return f"{sys.version_info.major}.{sys.version_info.minor}"
-
-
-def _patch_pyproject_toml_offline(pyproject_file: Path, wheels_dir: Path) -> None:
-    """
-    Add (or update) the [tool.uv] section in pyproject.toml to enable
-    offline installation from bundled wheels.
-
-    Adds:
-        [tool.uv]
-        no-index = true
-        find-links = ["./wheels/"]
-        environments = ["sys_platform == 'linux'"]
-
-    Also pins ``requires-python`` to the current runtime version so that
-    uv does not attempt to resolve dependencies for Python versions that
-    are not present in the bundled wheels.
-    """
-    content = pyproject_file.read_text()
-
-    # ------------------------------------------------------------------
-    # 1. Pin requires-python to the current runtime so uv does not try
-    #    to solve for future Python versions whose wheels we don't have.
-    # ------------------------------------------------------------------
-    py_ver = _detect_python_version()  # e.g. "3.12"
-    new_requires = f'requires-python = "=={py_ver}.*"'
-
-    if re.search(r'^requires-python\s*=', content, re.MULTILINE):
-        content = re.sub(
-            r'^requires-python\s*=\s*.*$',
-            new_requires,
-            content,
-            count=1,
-            flags=re.MULTILINE,
-        )
-    else:
-        # Insert under [project] if it exists
-        if re.search(r'^\[project\]', content, re.MULTILINE):
-            content = re.sub(
-                r'^(\[project\])',
-                rf'\1\n{new_requires}',
-                content,
-                count=1,
-                flags=re.MULTILINE,
-            )
-    print(f'   ✏  Pinned requires-python to "=={py_ver}.*".')
-
-    # ------------------------------------------------------------------
-    # 2. Add [tool.uv] offline settings and restrict resolution to
-    #    the current platform only. Without `environments`, uv tries
-    #    to resolve for ALL platforms (including Windows) and fails
-    #    when platform-specific wheels like colorama are missing.
-    # ------------------------------------------------------------------
-    uv_settings = (
-        'no-index = true\n'
-        'find-links = ["./wheels/"]\n'
-        'environments = ["sys_platform == \'linux\'"]'
-    )
-    uv_block = f'\n[tool.uv]\n{uv_settings}\n'
-
-    # Check if [tool.uv] already exists
-    if re.search(r"^\[tool\.uv\]", content, re.MULTILINE):
-        # Patch existing section: inject keys right after the header
-        def _inject(m: re.Match) -> str:
-            return m.group(0) + '\n' + uv_settings
-
-        content = re.sub(
-            r"^\[tool\.uv\]",
-            _inject,
-            content,
-            count=1,
-            flags=re.MULTILINE,
-        )
-    else:
-        # Append a new section
-        content = content.rstrip() + "\n" + uv_block
-
-    pyproject_file.write_text(content)
-    print("   ✏  Patched pyproject.toml with [tool.uv] offline settings.")
-
-    # ------------------------------------------------------------------
-    # 2. Remove uv.lock so that uv does not attempt to reconcile the
-    #    lockfile (which contains remote-index references) with
-    #    no-index = true.
-    # ------------------------------------------------------------------
-    lock_file = pyproject_file.parent / "uv.lock"
-    if lock_file.exists():
-        lock_file.unlink()
-        print("   ✏  Removed uv.lock to avoid remote-index reconciliation.")
+def _remove_from_ignore_files(extract_dir: Path, entries: set[str]) -> None:
+    """Remove specific entries from .difyignore and .gitignore if they exist."""
+    for ignore_name in (".difyignore", ".gitignore"):
+        ignore_file = extract_dir / ignore_name
+        if not ignore_file.exists():
+            continue
+        lines = ignore_file.read_text().splitlines()
+        filtered = [l for l in lines if l.strip() not in entries]
+        if len(filtered) != len(lines):
+            ignore_file.write_text("\n".join(filtered) + "\n")
+            removed = sorted({l.strip() for l in lines} & entries)
+            print(f"   ✏  Removed {removed} from {ignore_name}.")
 
 
 # ---------------------------------------------------------------------------
@@ -299,7 +354,7 @@ def package_offline(pkg_path: Path, cli: Path, work: Path) -> Path:
     Package a .difypkg with bundled wheels for offline use.
 
     1. Unzip the package
-    2. Download all dependencies as wheels (via uv)
+    2. Lock dependencies and download all wheels (via uv lock + uv pip download)
     3. Patch pyproject.toml or requirements.txt for offline use
     4. Re-pack using the dify-plugin CLI
     """
@@ -313,7 +368,7 @@ def package_offline(pkg_path: Path, cli: Path, work: Path) -> Path:
     with zipfile.ZipFile(pkg_path, "r") as zf:
         zf.extractall(extract_dir)
 
-    # -- Download wheels --
+    # -- Bundle dependencies --
     pyproject_file = extract_dir / "pyproject.toml"
     req_file = extract_dir / "requirements.txt"
     has_pyproject = pyproject_file.exists()
@@ -325,23 +380,17 @@ def package_offline(pkg_path: Path, cli: Path, work: Path) -> Path:
         wheels_dir = extract_dir / "wheels"
         wheels_dir.mkdir(exist_ok=True)
 
-        # Determine which file drives dependency resolution
-        # dify-plugin-daemon prioritises pyproject.toml over requirements.txt
         if has_pyproject:
-            print("   ℹ  pyproject.toml detected – using uv for dependency download.")
+            print("   ℹ  pyproject.toml detected – using uv lock + uv pip download.")
             _download_wheels_uv(extract_dir, wheels_dir)
-            _patch_pyproject_toml_offline(pyproject_file, wheels_dir)
+            _patch_pyproject_toml_offline(pyproject_file)
         else:
+            print("   ℹ  requirements.txt detected (no pyproject.toml) – using uv pip download.")
             _download_wheels_pip(req_file, wheels_dir)
             _patch_requirements_txt_offline(req_file)
 
-        # -- Patch .difyignore / .gitignore to not ignore wheels/ --
-        for ignore_name in (".difyignore", ".gitignore"):
-            ignore_file = extract_dir / ignore_name
-            if ignore_file.exists():
-                lines = ignore_file.read_text().splitlines()
-                lines = [l for l in lines if l.strip() != "wheels/"]
-                ignore_file.write_text("\n".join(lines) + "\n")
+        # Ensure wheels/ is not excluded by ignore files
+        _remove_from_ignore_files(extract_dir, {"wheels/", "wheels"})
 
     # -- Re-pack --
     output_name = f"{pkg_name}-offline.difypkg"
