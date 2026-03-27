@@ -1,0 +1,63 @@
+name: Repackage Dify Plugin
+
+on:
+  workflow_dispatch:
+    inputs:
+      plugin_author:
+        description: "plugin author"
+        required: true
+        type: string
+        default: "langgenius"
+      plugin_name:
+        description: "plugin name"
+        required: true
+        type: string
+        default: "openai_api_compatible"
+      plugin_version:
+        description: "plugin version"
+        required: true
+        type: string
+        default: "0.0.42"
+      platform_arm:
+        description: "Use ARM platform (true OR false)"
+        required: true
+        type: string
+        default: "false"
+
+jobs:
+  repackage:
+    runs-on: ${{ inputs.platform_arm == 'true' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    steps:
+      - name: Print workflow inputs
+        run: |
+          echo "plugin_author  = ${{ inputs.plugin_author }}"
+          echo "plugin_name    = ${{ inputs.plugin_name }}"
+          echo "plugin_version = ${{ inputs.plugin_version }}"
+          echo "platform_arm   = ${{ inputs.platform_arm }}"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Customize settings
+        run: cp .env.example .env
+
+      - name: Making Offline Packages from Dify Marketplace
+        run: |
+          docker compose run --rm packager --marketplace "${{ inputs.plugin_author }}/${{ inputs.plugin_name }}:${{ inputs.plugin_version }}"
+
+      - name: Find repackaged artifact
+        run: |
+          ARTIFACT_PATH=$(find difypkg -type f -name "*-offline.difypkg" | head -n 1)
+          if [ -z "$ARTIFACT_PATH" ]; then
+            echo "No *-${PACKAGE_SUFFIX}.difypkg artifact found!"
+            exit 1
+          fi
+
+          echo "ARTIFACT_PATH=$ARTIFACT_PATH" >> $GITHUB_ENV
+          echo "ARTIFACT_NAME=$(basename "$ARTIFACT_PATH")" >> $GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.ARTIFACT_PATH }}
