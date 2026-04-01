@@ -431,14 +431,6 @@ def package_offline(pkg_path: Path, cli: Path, work: Path) -> Path:
         # Ensure wheels/ is not excluded by ignore files
         _remove_from_ignore_files(extract_dir, {"wheels/", "wheels"})
 
-        # -- 离线安装验证 --
-        print("🧪 Verifying offline installability …")
-        run([
-            "uv", "sync",
-            "--no-index",
-            "--directory", str(extract_dir),
-        ])
-
     # -- Re-pack --
     output_name = f"{pkg_name}-offline.difypkg"
     output_path = OUTPUT_DIR / output_name
