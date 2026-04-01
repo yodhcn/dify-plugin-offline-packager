@@ -149,7 +149,7 @@ def _download_wheels_pip(req_file: Path, wheels_dir: Path) -> None:
     cmd = [
         "uv", "run", "pip", "wheel",
         "-r", str(req_file),
-        "-d", str(wheels_dir),
+        "-w", str(wheels_dir),
     ]
     if PIP_INDEX_URL:
         cmd += ["--index-url", PIP_INDEX_URL]
