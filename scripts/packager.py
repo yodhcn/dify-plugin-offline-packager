@@ -483,6 +483,12 @@ def package_offline(pkg_path: Path, cli: Path, work: Path) -> Path:
         # Ensure wheels/ is not excluded by ignore files
         _remove_from_ignore_files(extract_dir, {"wheels/", "wheels"})
 
+    # -- Clean up .venv directory created by uv sync --
+    venv_dir = extract_dir / ".venv"
+    if venv_dir.exists():
+        shutil.rmtree(venv_dir)
+        print("   🧹 Removed .venv directory (created by uv sync).")
+
     # -- Re-pack --
     output_name = f"{pkg_name}-offline.difypkg"
     output_path = OUTPUT_DIR / output_name
