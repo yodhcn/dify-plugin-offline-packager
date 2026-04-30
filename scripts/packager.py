@@ -65,20 +65,24 @@ def run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
         sys.exit(f"\n❌ Command failed (exit {e.returncode}): {' '.join(e.cmd)}")
 
 
+def _get_arch() -> str:
+    """Get the current platform architecture (amd64 or arm64)."""
+    machine = platform.machine().lower()
+    if machine in ("x86_64", "amd64"):
+        return "amd64"
+    elif machine in ("aarch64", "arm64"):
+        return "arm64"
+    else:
+        sys.exit(f"Unsupported architecture: {machine}")
+
+
 def ensure_dify_plugin_cli(work: Path) -> Path:
     """
     Ensure the dify-plugin CLI binary exists and is executable.
     Downloads from GitHub releases if not already cached.
     Returns the path to the binary.
     """
-    machine = platform.machine().lower()
-    if machine in ("x86_64", "amd64"):
-        arch = "amd64"
-    elif machine in ("aarch64", "arm64"):
-        arch = "arm64"
-    else:
-        sys.exit(f"Unsupported architecture: {machine}")
-
+    arch = _get_arch()
     binary_name = f"dify-plugin-linux-{arch}"
     BIN_DIR.mkdir(parents=True, exist_ok=True)
     cached = BIN_DIR / f"dify-plugin-cli-{DIFY_PLUGIN_DAEMON_VERSION}-{arch}"
@@ -490,7 +494,8 @@ def package_offline(pkg_path: Path, cli: Path, work: Path) -> Path:
         print("   🧹 Removed .venv directory (created by uv sync).")
 
     # -- Re-pack --
-    output_name = f"{pkg_name}-offline.difypkg"
+    arch = _get_arch()
+    output_name = f"{pkg_name}-{arch}-offline.difypkg"
     output_path = OUTPUT_DIR / output_name
 
     print(f"\n📦 Packaging → {output_name} …")
