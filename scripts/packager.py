@@ -382,22 +382,12 @@ def _patch_pyproject_toml_offline(pyproject_file: Path) -> None:
     """
     Add offline settings to the ``[tool.uv]`` section of pyproject.toml.
 
-    Merges into the existing ``[tool.uv]`` section (which already has
-    ``environments`` from ``_inject_environments``)::
-
-        no-index = true
-        find-links = ["./wheels/"]
-
-    uv.lock is deleted before packaging so that the target machine
-    re-resolves dependencies from wheels/ only (uv#15519: --no-index +
-    --frozen is a conflicting combination).
+    Only adds find-links to point to local wheels directory.
+    Does NOT set no-index to allow fallback to online sources if needed.
     """
     content = pyproject_file.read_text()
 
-    offline_settings = (
-        'no-index = true\n'
-        'find-links = ["./wheels/"]'
-    )
+    offline_settings = 'find-links = ["./wheels/"]'
     uv_block = f'\n[tool.uv]\n{offline_settings}\n'
 
     if re.search(r'^\[tool\.uv\]', content, re.MULTILINE):
@@ -414,7 +404,7 @@ def _patch_pyproject_toml_offline(pyproject_file: Path) -> None:
         content = content.rstrip() + "\n" + uv_block
 
     pyproject_file.write_text(content)
-    print("   ✏  Patched pyproject.toml with [tool.uv] offline settings (no-index, find-links).")
+    print("   ✏  Patched pyproject.toml with [tool.uv] find-links to wheels/.")
 
 
 def _patch_requirements_txt_offline(req_file: Path) -> None:
@@ -481,20 +471,20 @@ def package_offline(pkg_path: Path, cli: Path, work: Path) -> Path:
             original_pyproject = pyproject_file.read_text()
             _download_wheels_uv(extract_dir, wheels_dir)
 
-            # Create requirements.txt with all wheels for offline installation
+            # Add offline settings to pyproject.toml for target machine installation
             # This is needed because pyproject.toml deps (including dify-plugin) are not on PyPI
+            _patch_pyproject_toml_offline(pyproject_file)
+            
+            # Also create requirements.txt with all wheels as backup
             offline_req = extract_dir / "requirements.txt"
             wheels_content = sorted(wheels_dir.glob("*.whl"))
             if wheels_content:
-                # Write all wheel files - pip will find them via find-links
                 req_lines = ["--no-index", "--find-links=./wheels/"]
                 for whl in wheels_content:
-                    req_lines.append(f"./wheels/{whl.name}")
+                    req_lines.append(whl.stem)
                 offline_req.write_text("\n".join(req_lines))
                 print(f"   ✏  Created requirements.txt with {len(wheels_content)} offline wheels.")
-            # Restore original pyproject.toml to avoid packaging issues
-            pyproject_file.write_text(original_pyproject)
-            print("   ✏  Restored original pyproject.toml for packaging.")
+            print("   ✏  Keeping modified pyproject.toml with offline settings.")
         else:
             print("   ℹ  requirements.txt detected (no pyproject.toml) – using uv pip download.")
             _download_wheels_pip(req_file, wheels_dir)
