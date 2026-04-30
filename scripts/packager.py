@@ -237,36 +237,54 @@ def _download_wheels_pip(req_file: Path, wheels_dir: Path) -> None:
 
 def _download_wheels_uv(extract_dir: Path, wheels_dir: Path) -> None:
     """
-    正确的离线打包流程（基于 uv 实际解析结果）
+    Lock and download wheels using uv based on pyproject.toml.
     """
 
     pyproject_file = extract_dir / "pyproject.toml"
 
-    # 1. 预处理
     _inject_environments(pyproject_file)
     _strip_dependency_groups(pyproject_file)
 
-    # 2. 生成 lock（唯一可信依赖源）
     print("🔐 Locking dependencies …")
     run(["uv", "lock", "--directory", str(extract_dir)])
 
-    # 3. 真正安装到虚拟环境（关键！）
-    print("📦 Syncing dependencies (build full env) …")
-    run([
-        "uv", "sync",
-        "--directory", str(extract_dir),
-    ])
+    print("⬇  Exporting pinned dependencies …")
+    export_result = subprocess.run(
+        [
+            "uv", "export",
+            "--frozen", "--no-hashes", "--no-dev",
+            "--directory", str(extract_dir),
+        ],
+        capture_output=True, text=True,
+    )
+    if export_result.returncode != 0:
+        print("   ⚠  uv export failed:")
+        print(export_result.stderr, file=sys.stderr)
+        req_file = extract_dir / "requirements.txt"
+        if req_file.exists():
+            print("   ↪  Falling back to requirements.txt")
+            _download_wheels_pip(req_file, wheels_dir)
+        return
 
-    # 4. 从“已安装环境”导出 wheels（保证闭包）
-    print("⬇  Building wheels from resolved environment …")
+    exported_req = extract_dir / "_exported_requirements.txt"
+    exported_req.write_text(export_result.stdout)
+    try:
+        cmd = [
+            "uv", "run", "pip", "download",
+            "-r", str(exported_req),
+            "-d", str(wheels_dir),
+        ]
+        if PIP_INDEX_URL:
+            cmd += ["--index-url", PIP_INDEX_URL]
+        print("⬇  Downloading Python dependencies …")
+        run(cmd)
+    finally:
+        exported_req.unlink(missing_ok=True)
 
-    run([
-        "uv", "run", "pip", "wheel",
-        "--wheel-dir", str(wheels_dir),
-        "."
-    ], cwd=str(extract_dir))
-
-    print("   ✔ Wheels built from resolved environment.")
+    uv_lock = extract_dir / "uv.lock"
+    if uv_lock.exists():
+        uv_lock.unlink()
+        print("   ✔ Deleted uv.lock (target will re-resolve from wheels/).")
 
 
 def _inject_environments(pyproject_file: Path) -> None:
