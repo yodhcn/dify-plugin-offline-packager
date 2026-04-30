@@ -481,13 +481,17 @@ def package_offline(pkg_path: Path, cli: Path, work: Path) -> Path:
             original_pyproject = pyproject_file.read_text()
             _download_wheels_uv(extract_dir, wheels_dir)
 
-            # Create/update requirements.txt with offline settings for target installation
+            # Create requirements.txt with all wheels for offline installation
+            # This is needed because pyproject.toml deps (including dify-plugin) are not on PyPI
             offline_req = extract_dir / "requirements.txt"
-            existing_req = ""
-            if offline_req.exists():
-                existing_req = offline_req.read_text()
-            offline_req.write_text(f"--no-index\n--find-links=./wheels/\n{existing_req}")
-            print("   ✏  Updated requirements.txt with offline settings.")
+            wheels_content = sorted(wheels_dir.glob("*.whl"))
+            if wheels_content:
+                # Write all wheel files - pip will find them via find-links
+                req_lines = ["--no-index", "--find-links=./wheels/"]
+                for whl in wheels_content:
+                    req_lines.append(f"./wheels/{whl.name}")
+                offline_req.write_text("\n".join(req_lines))
+                print(f"   ✏  Created requirements.txt with {len(wheels_content)} offline wheels.")
             # Restore original pyproject.toml to avoid packaging issues
             pyproject_file.write_text(original_pyproject)
             print("   ✏  Restored original pyproject.toml for packaging.")
