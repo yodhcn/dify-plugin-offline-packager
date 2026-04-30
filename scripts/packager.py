@@ -238,6 +238,8 @@ def _download_wheels_pip(req_file: Path, wheels_dir: Path) -> None:
 def _download_wheels_uv(extract_dir: Path, wheels_dir: Path) -> None:
     """
     Lock and download wheels using uv based on pyproject.toml.
+    Uses uv sync to install deps, then exports wheels from installed environment
+    to ensure version consistency.
     """
 
     pyproject_file = extract_dir / "pyproject.toml"
@@ -248,6 +250,43 @@ def _download_wheels_uv(extract_dir: Path, wheels_dir: Path) -> None:
     print("🔐 Locking dependencies …")
     run(["uv", "lock", "--directory", str(extract_dir)])
 
+    print("📦 Syncing dependencies (install to env) …")
+    run(["uv", "sync", "--directory", str(extract_dir)])
+
+    print("⬇  Exporting pinned dependencies …")
+    export_result = subprocess.run(
+        [
+            "uv", "pip", "freeze",
+            "--directory", str(extract_dir),
+        ],
+        capture_output=True, text=True,
+    )
+
+    if export_result.returncode != 0:
+        print("   ⚠  uv pip freeze failed, using fallback method")
+        _download_wheels_uv_fallback(extract_dir, wheels_dir, pyproject_file)
+        return
+
+    freeze_file = extract_dir / "_frozen_requirements.txt"
+    freeze_file.write_text(export_result.stdout)
+    try:
+        cmd = [
+            "uv", "run", "pip", "wheel",
+            "-r", str(freeze_file),
+            "-w", str(wheels_dir),
+        ]
+        if PIP_INDEX_URL:
+            cmd += ["--index-url", PIP_INDEX_URL]
+        print("⬇  Downloading wheels from frozen env …")
+        run(cmd)
+    finally:
+        freeze_file.unlink(missing_ok=True)
+
+    print("   ✔ Wheels downloaded from frozen environment.")
+
+
+def _download_wheels_uv_fallback(extract_dir: Path, wheels_dir: Path, pyproject_file: Path) -> None:
+    """Fallback method using uv export + pip download."""
     print("⬇  Exporting pinned dependencies …")
     export_result = subprocess.run(
         [
@@ -280,11 +319,6 @@ def _download_wheels_uv(extract_dir: Path, wheels_dir: Path) -> None:
         run(cmd)
     finally:
         exported_req.unlink(missing_ok=True)
-
-    uv_lock = extract_dir / "uv.lock"
-    if uv_lock.exists():
-        uv_lock.unlink()
-        print("   ✔ Deleted uv.lock (target will re-resolve from wheels/).")
 
 
 def _inject_environments(pyproject_file: Path) -> None:
