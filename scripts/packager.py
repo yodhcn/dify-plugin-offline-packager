@@ -477,8 +477,20 @@ def package_offline(pkg_path: Path, cli: Path, work: Path) -> Path:
 
         if has_pyproject:
             print("   ℹ  pyproject.toml detected – using uv lock + uv pip download.")
+            # Save original pyproject.toml before modifications
+            original_pyproject = pyproject_file.read_text()
             _download_wheels_uv(extract_dir, wheels_dir)
-            _patch_pyproject_toml_offline(pyproject_file)
+
+            # Create/update requirements.txt with offline settings for target installation
+            offline_req = extract_dir / "requirements.txt"
+            existing_req = ""
+            if offline_req.exists():
+                existing_req = offline_req.read_text()
+            offline_req.write_text(f"--no-index\n--find-links=./wheels/\n{existing_req}")
+            print("   ✏  Updated requirements.txt with offline settings.")
+            # Restore original pyproject.toml to avoid packaging issues
+            pyproject_file.write_text(original_pyproject)
+            print("   ✏  Restored original pyproject.toml for packaging.")
         else:
             print("   ℹ  requirements.txt detected (no pyproject.toml) – using uv pip download.")
             _download_wheels_pip(req_file, wheels_dir)
@@ -486,6 +498,12 @@ def package_offline(pkg_path: Path, cli: Path, work: Path) -> Path:
 
         # Ensure wheels/ is not excluded by ignore files
         _remove_from_ignore_files(extract_dir, {"wheels/", "wheels"})
+
+        # Remove .venv created by uv sync (wheels are already in wheels/)
+        venv_dir = extract_dir / ".venv"
+        if venv_dir.exists():
+            print("   🧹 Removing .venv (wheels already bundled)")
+            shutil.rmtree(venv_dir)
 
     # -- Re-pack --
     arch = _get_arch()
